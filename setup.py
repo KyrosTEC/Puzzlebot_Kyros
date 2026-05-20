@@ -1,0 +1,30 @@
+from glob import glob
+from setuptools import find_packages, setup
+
+package_name = 'half_term_challenge'
+
+setup(
+    name=package_name,
+    version='0.0.0',
+    packages=find_packages(exclude=['test']),
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        # Templates de señales — se copian al share del paquete instalado
+        ('share/' + package_name + '/templates',
+            glob('half_term_challenge/templates/*')),
+    ],
+    install_requires=['setuptools'],
+    zip_safe=True,
+    maintainer='Tu Nombre',
+    maintainer_email='tu@email.com',
+    description='Half Term Challenge - Traffic Light Navigation',
+    license='Apache-2.0',
+    tests_require=['pytest'],
+    entry_points={
+        'console_scripts': [
+            'controller = half_term_challenge.controller:main',
+        ],
+    },
+)
