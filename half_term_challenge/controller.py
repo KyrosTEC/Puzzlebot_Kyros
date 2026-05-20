@@ -13,38 +13,139 @@ from half_term_challenge.traffic_light_detection import TrafficLightDetection, g
 from half_term_challenge.centerline import CenterLineDetector
 
 
+class PIDController:
+    """
+    Controlador PID con anti-windup y derivada filtrada (sobre el error,
+    no sobre la salida, para evitar derivative kick).
+
+    u(t) = Kp·e + Ki·∫e dt + Kd·(de/dt)
+
+    Anti-windup: el integrador se congela cuando la salida está saturada
+    y el error sigue sumando en la misma dirección.
+
+    Derivada: promediada con EMA (alpha_d) para reducir ruido de alta
+    frecuencia causado por la visión.
+    """
+
+    def __init__(self,
+                 Kp: float,
+                 Ki: float,
+                 Kd: float,
+                 output_min: float,
+                 output_max: float,
+                 alpha_d: float = 0.25):
+        self.Kp  = Kp
+        self.Ki  = Ki
+        self.Kd  = Kd
+        self.out_min = output_min
+        self.out_max = output_max
+        self.alpha_d = alpha_d
+
+        self._integral   = 0.0
+        self._prev_error = 0.0
+        self._d_filtered = 0.0
+        self._prev_time  = None
+
+    def reset(self):
+        self._integral   = 0.0
+        self._prev_error = 0.0
+        self._d_filtered = 0.0
+        self._prev_time  = None
+
+    def compute(self, error: float) -> float:
+        now = time.time()
+
+        if self._prev_time is None:
+            dt = 0.02
+        else:
+            dt = now - self._prev_time
+            dt = max(dt, 1e-4)   # evitar división por cero
+        self._prev_time = now
+
+        # Término proporcional
+        P = self.Kp * error
+
+        # Término derivativo (EMA sobre de/dt)
+        raw_d = (error - self._prev_error) / dt
+        self._d_filtered = (self.alpha_d * raw_d +
+                            (1 - self.alpha_d) * self._d_filtered)
+        D = self.Kd * self._d_filtered
+
+        # Salida sin integrador (para anti-windup)
+        output_pd = P + D
+        output_pd_clamped = float(np.clip(output_pd, self.out_min, self.out_max))
+
+        # Anti-windup: integrar solo si no estamos saturados o el error
+        # ayuda a salir de la saturación
+        saturated = (output_pd != output_pd_clamped)
+        if not saturated or (error * self._integral < 0):
+            self._integral += error * dt
+
+        # Límite del integrador (wind-up cap)
+        max_integral = 0.5 / max(self.Ki, 1e-6)
+        self._integral = float(np.clip(self._integral, -max_integral, max_integral))
+
+        I = self.Ki * self._integral
+
+        output = float(np.clip(P + I + D, self.out_min, self.out_max))
+
+        self._prev_error = error
+        return output
+
+
+# ══════════════════════════════════════════════════════════════════════════
 class LineFollowerController(Node):
     """
-    PuzzleBot — seguidor de línea negra + semáforo.
-    Señales de tráfico desactivadas.
+    PuzzleBot — seguidor de línea negra + semáforo con controlador PID.
 
-    Control:
-        error_norm = (cx - w/2) / (w/2)
-        Wc = -Kw * error_norm
-        Vc = constante según semáforo
+    Controlador angular PID:
+        error_norm = (cx - w/2) / (w/2)    ∈ [-1, 1]
+        Wc = PID_angular.compute(error_norm)
+
+    Velocidad lineal adaptativa:
+        Vc = normal_speed × (1 - |error_norm| × speed_reduction)
+        → El robot frena en curvas pronunciadas.
 
     Semáforo:
-        green/none → normal_speed
-        yellow     → slow_speed
-        red        → parar, esperar verde
+        green / none → velocidad normal
+        yellow       → slow_speed (sin freno adaptativo adicional)
+        red          → parar, esperar verde
     """
 
     def __init__(self):
         super().__init__('line_follower_controller')
 
-        # ── Ganancias ─────────────────────────────────────────────────────
-        self.Kw     = 1.2   # antes 1.5 — más suave en curvas
-        self.Wc_max = 1.8   # antes 2.0
+        # ── PID angular ──────────────────────────────────────────────────
+        # Kp: ganancia proporcional (principal respuesta al error lateral)
+        # Ki: elimina error estático en rectas con sesgo (cinta pegada al piso)
+        # Kd: amortigua oscilaciones en curvas
+        # Ajusta estos valores en el laboratorio observando la oscilación.
+        # Método empírico sugerido:
+        #   1. Ki=0, Kd=0 → sube Kp hasta que oscile → Kp_crítico
+        #   2. Kp = 0.6 * Kp_crítico
+        #   3. Kd ≈ Kp * 0.05  (muy pequeño al inicio)
+        #   4. Ki ≈ Kp * 0.01  (si persiste offset)
+        self.pid_angular = PIDController(
+            Kp=1.4,
+            Ki=0.05,
+            Kd=0.12,
+            output_min=-2.0,
+            output_max= 2.0,
+            alpha_d=0.25,
+        )
 
         # ── Velocidades ───────────────────────────────────────────────────
-        self.normal_speed = 0.08   # antes 0.15
-        self.slow_speed   = 0.05   # antes 0.08
+        self.normal_speed    = 0.08   # m/s en recta libre
+        self.slow_speed      = 0.05   # m/s con semáforo amarillo
+        self.speed_reduction = 0.55   # fracción de frenado en curva
+        #  Vc_real = normal_speed * (1 - |error| * speed_reduction)
+        #  Con error=1.0 → Vc = normal_speed * (1 - 0.55) = 45% de la vel máx
 
-        # ── Comando actual (calculado en cam_timer, publicado en ctrl_timer)
-        self._cmd_linear  = 0.0
-        self._cmd_angular = 0.0
-        self._error_norm  = 0.0
-        self._line_lost   = False
+        # ── Estado de control ─────────────────────────────────────────────
+        self._cmd_linear   = 0.0
+        self._cmd_angular  = 0.0
+        self._error_norm   = 0.0
+        self._line_lost    = False
 
         # ── Semáforo ──────────────────────────────────────────────────────
         self.traffic_state     = "none"
@@ -52,11 +153,15 @@ class LineFollowerController(Node):
 
         self.lock = threading.Lock()
 
-        # ── Detectores ───────────────────────────────────────────────────
+        # ── Detectores ────────────────────────────────────────────────────
         self.traffic_detector = TrafficLightDetection()
-        self.line_detector    = CenterLineDetector()
+        self.line_detector    = CenterLineDetector(
+            alpha=0.35,
+            lost_timeout=2.0,
+            roi_top_frac=0.60,
+        )
 
-        # ── Cámara ───────────────────────────────────────────────────────
+        # ── Cámara ────────────────────────────────────────────────────────
         self.cap = cv.VideoCapture(
             gstreamer_pipeline(
                 flip_method=0,
@@ -73,10 +178,10 @@ class LineFollowerController(Node):
         else:
             self.get_logger().info("Camera opened successfully!")
 
-        # ── Grabación ─────────────────────────────────────────────────────
-        ts = time.strftime("%Y%m%d_%H%M%S")
+        # ── Grabación de vídeo ────────────────────────────────────────────
+        ts         = time.strftime("%Y%m%d_%H%M%S")
         video_path = os.path.expanduser(f"~/puzzlebot_run_{ts}.mp4")
-        fourcc = cv.VideoWriter_fourcc(*'mp4v')
+        fourcc     = cv.VideoWriter_fourcc(*'mp4v')
         self._video_writer = cv.VideoWriter(video_path, fourcc, 10, (640, 360))
         self._video_path   = video_path
         self.get_logger().info(f"Recording to: {video_path}")
@@ -88,11 +193,15 @@ class LineFollowerController(Node):
         self.pub_vel   = self.create_publisher(Twist,  '/cmd_vel', 10)
         self.pub_state = self.create_publisher(String, '/traffic_light_state', 10)
 
-        # ── Timers ───────────────────────────────────────────────────────
-        self.cam_timer  = self.create_timer(0.1,  self.camera_callback)
+        # ── Timers ────────────────────────────────────────────────────────
+        # cam_timer  : procesamiento de imagen  (100 ms → 10 Hz)
+        # ctrl_timer : publicar cmd_vel          (20 ms  → 50 Hz)
+        self.cam_timer  = self.create_timer(0.10, self.camera_callback)
         self.ctrl_timer = self.create_timer(0.02, self.control_callback)
 
-        self.get_logger().info("Line Follower Controller Started (semaforo + linea)")
+        self.get_logger().info(
+            "LineFollowerController iniciado (PID angular + semáforo)"
+        )
 
     # ══════════════════════════════════════════════════════════════════════
     def camera_callback(self):
@@ -105,30 +214,40 @@ class LineFollowerController(Node):
         h, w = image.shape[:2]
 
         # ── Semáforo ──────────────────────────────────────────────────────
-        tl_state, r_area, y_area, g_area = self.traffic_detector.detect_state(image)
+        tl_state, r_area, y_area, g_area = \
+            self.traffic_detector.detect_state(image)
 
-        # ── Línea ─────────────────────────────────────────────────────────
-        result = self.line_detector.detect_center_line(image)
+        # ── Detección de línea ────────────────────────────────────────────
+        result    = self.line_detector.detect_center_line(image)
         line_lost = (result is None)
 
         if line_lost:
-            # Sin línea: mantener Wc anterior, reducir Vc
+            # Línea perdida → mantener giro anterior, reducir velocidad
             with self.lock:
                 prev_wc = self._cmd_angular
             Vc = self.slow_speed * 0.4
-            Wc = prev_wc * 0.5   # reducir giro gradualmente
+            Wc = prev_wc * 0.5
             error_norm = self._error_norm
         else:
-            cx, cy = result
-            error_norm = (cx - w / 2.0) / (w / 2.0)
-            Wc = float(np.clip(-self.Kw * error_norm, -self.Wc_max, self.Wc_max))
+            # ── Error para el PID (ya suavizado por el detector) ──────────
+            error_norm = self.line_detector.smooth_error
+
+            # ── PID angular ───────────────────────────────────────────────
+            # Negamos porque error>0 (línea a la derecha) → girar derecha (Wc<0)
+            Wc = self.pid_angular.compute(-error_norm)
+
+            # ── Velocidad lineal adaptativa ───────────────────────────────
             if tl_state == "yellow":
                 Vc = self.slow_speed
             elif tl_state in ("none", "green"):
-                Vc = self.normal_speed
-            else:
+                # Frenado suave en curva: mayor error → menor Vc
+                speed_factor = 1.0 - abs(error_norm) * self.speed_reduction
+                speed_factor = max(speed_factor, 0.30)   # mínimo 30% de Vc
+                Vc = self.normal_speed * speed_factor
+            else:   # red
                 Vc = 0.0
                 Wc = 0.0
+                self.pid_angular.reset()
 
         with self.lock:
             self.traffic_state = tl_state
@@ -138,15 +257,15 @@ class LineFollowerController(Node):
             self._line_lost    = line_lost
 
         # ── Publicar estado semáforo ──────────────────────────────────────
-        msg = String()
+        msg      = String()
         msg.data = tl_state
         self.pub_state.publish(msg)
 
         # ── Debug visual ──────────────────────────────────────────────────
         debug = image.copy()
-        debug = self._draw(debug, result, error_norm, tl_state, line_lost)
+        debug = self._draw(debug, result, error_norm, tl_state, line_lost, Vc, Wc)
         self._video_writer.write(debug)
-        cv.imshow('PuzzleBot', debug)
+        cv.imshow('PuzzleBot PID', debug)
         cv.waitKey(1)
 
         # ── Log ~1 Hz ─────────────────────────────────────────────────────
@@ -154,8 +273,10 @@ class LineFollowerController(Node):
         if self._log_count >= 10:
             self._log_count = 0
             self.get_logger().info(
-                f"TL={tl_state} | lost={line_lost} err={error_norm:+.2f} "
-                f"Vc={Vc:.2f} Wc={Wc:.2f}"
+                f"TL={tl_state}({self.traffic_detector.confidence:.0%}) "
+                f"| lost={line_lost} "
+                f"| err={error_norm:+.3f} "
+                f"| Vc={Vc:.3f} Wc={Wc:+.3f}"
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -164,17 +285,17 @@ class LineFollowerController(Node):
             tl_state  = self.traffic_state
             Vc        = self._cmd_linear
             Wc        = self._cmd_angular
-            line_lost = self._line_lost
 
         # ── Lógica semáforo ───────────────────────────────────────────────
         if tl_state == "red":
             if not self.waiting_for_green:
-                self.get_logger().info("RED — esperando VERDE...")
+                self.get_logger().info("RED — detenido, esperando VERDE...")
+                self.pid_angular.reset()
             self.waiting_for_green = True
 
         if self.waiting_for_green and tl_state == "green":
             self.waiting_for_green = False
-            self.get_logger().info("GREEN — reanudando!")
+            self.get_logger().info("GREEN — reanudando recorrido!")
 
         if self.waiting_for_green:
             self._publish(0.0, 0.0)
@@ -183,45 +304,53 @@ class LineFollowerController(Node):
         self._publish(Vc, Wc)
 
     # ══════════════════════════════════════════════════════════════════════
-    def _publish(self, linear, angular):
-        cmd = Twist()
-        cmd.linear.x  = float(linear)
-        cmd.angular.z = float(angular)
+    def _publish(self, linear: float, angular: float):
+        cmd             = Twist()
+        cmd.linear.x    = float(linear)
+        cmd.angular.z   = float(angular)
         self.pub_vel.publish(cmd)
 
-    def _draw(self, image, result, error_norm, tl_state, line_lost):
+    # ══════════════════════════════════════════════════════════════════════
+    def _draw(self, image, result, error_norm, tl_state,
+              line_lost, Vc, Wc) -> np.ndarray:
         h, w = image.shape[:2]
 
         # Línea central de referencia
         cv.line(image, (w // 2, 0), (w // 2, h), (255, 255, 0), 1)
 
-        # Punto y ROI del line detector
+        # Overlay del line detector (ROI + punto)
         self.line_detector.draw_debug(image, result)
 
-        # Punto detectado
-        if result is not None:
-            cx, cy = result
-            color = (0, 255, 0) if not line_lost else (0, 0, 255)
-            cv.circle(image, (cx, cy), 8, color, -1)
-            cv.line(image, (w // 2, cy), (cx, cy), color, 2)
+        # Colores por estado
+        tl_color = {
+            "red": (0, 0, 255), "yellow": (0, 255, 255),
+            "green": (0, 255, 0), "none": (255, 255, 255)
+        }.get(tl_state, (255, 255, 255))
 
         # HUD
-        tl_color = {
-            "red": (0,0,255), "yellow": (0,255,255),
-            "green": (0,255,0), "none": (255,255,255)
-        }.get(tl_state, (255,255,255))
-
         overlay = image.copy()
-        cv.rectangle(overlay, (10, 10), (400, 120), (0,0,0), -1)
-        cv.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+        cv.rectangle(overlay, (10, 10), (420, 155), (0, 0, 0), -1)
+        cv.addWeighted(overlay, 0.55, image, 0.45, 0, image)
 
-        cv.putText(image, f"Traffic: {tl_state.upper()}", (20, 48),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, tl_color, 2)
-        cv.putText(image, f"Err: {error_norm:+.2f}  Wait: {self.waiting_for_green}",
-                   (20, 85), cv.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 1)
+        cv.putText(image,
+                   f"Traffic: {tl_state.upper()} "
+                   f"({self.traffic_detector.confidence:.0%})",
+                   (20, 45), cv.FONT_HERSHEY_SIMPLEX, 0.85, tl_color, 2)
+        cv.putText(image,
+                   f"Err: {error_norm:+.3f}  Wait: {self.waiting_for_green}",
+                   (20, 82), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv.putText(image,
+                   f"Vc={Vc:.3f} m/s   Wc={Wc:+.3f} rad/s",
+                   (20, 115), cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 230, 255), 1)
+        cv.putText(image,
+                   f"PID Kp={self.pid_angular.Kp} "
+                   f"Ki={self.pid_angular.Ki} "
+                   f"Kd={self.pid_angular.Kd}",
+                   (20, 148), cv.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1)
+
         if line_lost:
-            cv.putText(image, "LINE LOST", (w//2 - 90, h//2),
-                       cv.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
+            cv.putText(image, "LINE LOST", (w // 2 - 100, h // 2),
+                       cv.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
         return image
 
@@ -238,13 +367,14 @@ class LineFollowerController(Node):
         super().destroy_node()
 
 
+# ══════════════════════════════════════════════════════════════════════════
 def main(args=None):
     rclpy.init(args=args)
     node = LineFollowerController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Detenido por el usuario")
+        node.get_logger().info("Detenido por el usuario.")
     finally:
         node.destroy_node()
         rclpy.shutdown()
