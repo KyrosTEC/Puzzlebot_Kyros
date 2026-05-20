@@ -9,8 +9,8 @@ from geometry_msgs.msg import Twist
 import numpy as np
 import cv2 as cv
 
-from half_term_challenge.traffic_light_detection import TrafficLightDetection, gstreamer_pipeline
-from half_term_challenge.centerline import CenterLineDetector
+from half_term_challenge.traffic_light_detection import TrafficLightDetection, gstreamer_pipelin
+from half_term_challenge.centerline_v2 import CenterLineDetectorV2 as CenterLineDetector
 
 
 class LineFollowerController(Node):

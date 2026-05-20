@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# ROS2 build artifacts
+install/
+log/
+
+# Videos y grabaciones del PuzzleBot
+*.mp4
+*.avi
+*.mkv
+
+# Screenshots y outputs de prueba
+screenshot*.png
+tuning_*.png
+meta_output.png
+config_tuned.json
+
+# Test local
+test_centerline_v2.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
