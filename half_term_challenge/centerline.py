@@ -25,7 +25,14 @@ class CenterLineDetector:
         best_candidate = (0, 0)
         h, w, _ = image.shape
 
-        roi = image[int(3 * h / 4):h, :]
+        # ── ROI: tercio inferior + franja central del 50% del ancho ──────
+        # Recortar lateralmente elimina los cuadraditos del cruce peatonal
+        # que están a los lados y confunden al detector.
+        roi_full = image[int(3 * h / 4):h, :]
+        roi_h, roi_w = roi_full.shape[:2]
+        x_margin = roi_w // 4              # 25% cada lado → centro 50%
+        roi      = roi_full[:, x_margin: roi_w - x_margin]
+        x_offset = x_margin                # para convertir coords de vuelta
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -45,7 +52,7 @@ class CenterLineDetector:
             cv2.CHAIN_APPROX_SIMPLE
         )
 
-        center_x   = w // 2
+        center_x   = w // 2      # centro del frame completo
         best_score = float('inf')
 
         if self.last_x is None:
@@ -67,11 +74,12 @@ class CenterLineDetector:
             if M["m00"] == 0:
                 continue
 
-            cx = int(M["m10"] / M["m00"])
+            # Convertir coords de la ROI recortada → frame completo
+            cx = int(M["m10"] / M["m00"]) + x_offset
             cy = int(M["m01"] / M["m00"])
 
             bottom_point = tuple(cnt[cnt[:, :, 1].argmax()][0])
-            cx_bottom    = bottom_point[0]
+            cx_bottom    = bottom_point[0] + x_offset
 
             dist_center   = abs(cx - center_x)
             height_weight = -cv2.boundingRect(cnt)[3]
@@ -102,8 +110,7 @@ class CenterLineDetector:
             now = time.time()
             if (self._last_detect_time is None or
                     now - self._last_detect_time > self.lost_timeout):
-                return None   # línea perdida por timeout
-            # Dentro del timeout: mantener última posición
+                return None
             final_x = self.last_x if self.last_x is not None else center_x
             return (final_x, int(0.9 * h))
 
@@ -115,9 +122,16 @@ class CenterLineDetector:
 
     def draw_debug(self, image, result):
         h, w = image.shape[:2]
-        roi_y = int(3 * h / 4)
-        cv2.rectangle(image, (0, roi_y), (w, h), (100, 100, 255), 1)
+        roi_y    = int(3 * h / 4)
+        x_margin = w // 4
+
+        # ROI recortada visible en azul
+        cv2.rectangle(image,
+                      (x_margin, roi_y), (w - x_margin, h),
+                      (100, 100, 255), 2)
+        # Centro del frame
         cv2.line(image, (w // 2, roi_y), (w // 2, h), (255, 255, 0), 1)
+
         if result is not None:
             cx, cy = result
             cv2.circle(image, (cx, cy), 8, (0, 255, 0), -1)

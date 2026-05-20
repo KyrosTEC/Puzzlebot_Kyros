@@ -11,7 +11,6 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # Templates de señales — se copian al share del paquete instalado
         ('share/' + package_name + '/templates',
             glob('half_term_challenge/templates/*')),
     ],
@@ -19,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='Tu Nombre',
     maintainer_email='tu@email.com',
-    description='Half Term Challenge - Traffic Light Navigation',
+    description='Half Term Challenge - PID Line Follower + Traffic Light',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

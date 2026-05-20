@@ -1,254 +1,158 @@
-import os
 import time
-import threading
-
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
-from geometry_msgs.msg import Twist
 import numpy as np
-import cv2 as cv
-
-from half_term_challenge.traffic_light_detection import TrafficLightDetection, gstreamer_pipeline
-from half_term_challenge.centerline import CenterLineDetector
+import cv2
 
 
-class LineFollowerController(Node):
+class CenterLineDetector:
     """
-    PuzzleBot — seguidor de línea negra + semáforo.
-    Señales de tráfico desactivadas.
+    Detector de la línea negra central.
 
-    Control:
-        error_norm = (cx - w/2) / (w/2)
-        Wc = -Kw * error_norm
-        Vc = constante según semáforo
-
-    Semáforo:
-        green/none → normal_speed
-        yellow     → slow_speed
-        red        → parar, esperar verde
+    Usa el detector original (Otsu + contornos) que funciona bien en curvas,
+    con dos mejoras:
+      1. ROI recortada lateralmente (40% central) para ignorar bordes y cuadraditos.
+      2. Devuelve el error normalizado [-1, 1] directamente, además de (x, y).
+         error > 0 → línea a la derecha del centro → girar derecha (Wc < 0)
+         error < 0 → línea a la izquierda           → girar izquierda (Wc > 0)
     """
 
     def __init__(self):
-        super().__init__('line_follower_controller')
+        self.last_x   = None
+        self.prev_x   = None
+        self.alpha    = 0.3       # suavizado EMA de la posición
 
-        # ── Ganancias ─────────────────────────────────────────────────────
-        self.Kw     = 1.2   # antes 1.5 — más suave en curvas
-        self.Wc_max = 1.8   # antes 2.0
+        self._last_detect_time = None
+        self.lost_timeout      = 2.0   # s → devuelve None
 
-        # ── Velocidades ───────────────────────────────────────────────────
-        self.normal_speed = 0.08   # antes 0.15
-        self.slow_speed   = 0.05   # antes 0.08
+    def reset_memory(self):
+        self.last_x   = None
+        self.prev_x   = None
+        self._last_detect_time = None
 
-        # ── Comando actual (calculado en cam_timer, publicado en ctrl_timer)
-        self._cmd_linear  = 0.0
-        self._cmd_angular = 0.0
-        self._error_norm  = 0.0
-        self._line_lost   = False
+    # ──────────────────────────────────────────────────────────────────────
+    def detect(self, image):
+        """
+        Retorna (error_norm, cx, cy) o None si línea perdida.
+        error_norm ∈ [-1, 1]: negativo=izquierda, positivo=derecha.
+        """
+        h, w, _ = image.shape
 
-        # ── Semáforo ──────────────────────────────────────────────────────
-        self.traffic_state     = "none"
-        self.waiting_for_green = False
+        # ── ROI: cuarto inferior, franja central 40% ──────────────────────
+        roi_full = image[int(3 * h / 4):h, :]
+        rh, rw   = roi_full.shape[:2]
+        x_margin = int(rw * 0.30)          # 30% cada lado → 40% central
+        roi      = roi_full[:, x_margin: rw - x_margin]
+        x_offset = x_margin
 
-        self.lock = threading.Lock()
-
-        # ── Detectores ───────────────────────────────────────────────────
-        self.traffic_detector = TrafficLightDetection()
-        self.line_detector    = CenterLineDetector()
-
-        # ── Cámara ───────────────────────────────────────────────────────
-        self.cap = cv.VideoCapture(
-            gstreamer_pipeline(
-                flip_method=0,
-                capture_width=1280,
-                capture_height=720,
-                display_width=640,
-                display_height=360,
-                framerate=15,
-            ),
-            cv.CAP_GSTREAMER
+        # ── Threshold Otsu inverso ────────────────────────────────────────
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(
+            blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
         )
-        if not self.cap.isOpened():
-            self.get_logger().error("Cannot open camera!")
+        k = np.ones((5, 5), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  k)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k)
+
+        contours, _ = cv2.findContours(
+            thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        center_x = w // 2
+        if self.last_x is None:
+            reference_x = center_x
+        elif self.prev_x is not None:
+            delta = np.clip(self.last_x - self.prev_x, -20, 20)
+            reference_x = int(self.last_x + delta)
         else:
-            self.get_logger().info("Camera opened successfully!")
+            reference_x = self.last_x
 
-        # ── Grabación ─────────────────────────────────────────────────────
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        video_path = os.path.expanduser(f"~/puzzlebot_run_{ts}.mp4")
-        fourcc = cv.VideoWriter_fourcc(*'mp4v')
-        self._video_writer = cv.VideoWriter(video_path, fourcc, 10, (640, 360))
-        self._video_path   = video_path
-        self.get_logger().info(f"Recording to: {video_path}")
+        best_score = float('inf')
+        best_cx    = None
+        best_cy    = None
 
-        # ── Log throttle ──────────────────────────────────────────────────
-        self._log_count = 0
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 100:
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
 
-        # ── Publicadores ──────────────────────────────────────────────────
-        self.pub_vel   = self.create_publisher(Twist,  '/cmd_vel', 10)
-        self.pub_state = self.create_publisher(String, '/traffic_light_state', 10)
+            cx = int(M["m10"] / M["m00"]) + x_offset   # frame completo
+            cy = int(M["m01"] / M["m00"])
 
-        # ── Timers ───────────────────────────────────────────────────────
-        self.cam_timer  = self.create_timer(0.1,  self.camera_callback)
-        self.ctrl_timer = self.create_timer(0.02, self.control_callback)
+            bottom_pt = tuple(cnt[cnt[:, :, 1].argmax()][0])
+            cx_bot    = bottom_pt[0] + x_offset
 
-        self.get_logger().info("Line Follower Controller Started (semaforo + linea)")
+            bx, by, bw, bh = cv2.boundingRect(cnt)
 
-    # ══════════════════════════════════════════════════════════════════════
-    def camera_callback(self):
-        if not self.cap.isOpened():
-            return
-        ret, image = self.cap.read()
-        if not ret:
-            return
+            dist_center   = abs(cx - center_x)
+            height_bonus  = -bh
+            area_bonus    = -area / 100.0
+            score         = dist_center + height_bonus + area_bonus
 
-        h, w = image.shape[:2]
+            if self.last_x is not None:
+                motion      = abs(self.last_x - self.prev_x) if self.prev_x is not None else 0
+                jump_w      = 0.8 if motion > 25 else 2.0
+                score      += abs(cx - reference_x) * jump_w
 
-        # ── Semáforo ──────────────────────────────────────────────────────
-        tl_state, r_area, y_area, g_area = self.traffic_detector.detect_state(image)
+            score += abs(cx_bot - center_x) * 2.0
 
-        # ── Línea ─────────────────────────────────────────────────────────
-        result = self.line_detector.detect_center_line(image)
-        line_lost = (result is None)
+            if self.last_x is None and abs(cx - center_x) > 50:
+                continue
+            if bw > 50:
+                score += 200
 
-        if line_lost:
-            # Sin línea: mantener Wc anterior, reducir Vc
-            with self.lock:
-                prev_wc = self._cmd_angular
-            Vc = self.slow_speed * 0.4
-            Wc = prev_wc * 0.5   # reducir giro gradualmente
-            error_norm = self._error_norm
+            if score < best_score:
+                best_score = score
+                best_cx    = cx
+                best_cy    = cy + int(3 * h / 4)
+
+        # ── Sin candidato ─────────────────────────────────────────────────
+        if best_cx is None:
+            now = time.time()
+            if (self._last_detect_time is None or
+                    now - self._last_detect_time > self.lost_timeout):
+                return None
+            # Dentro del timeout: mantener último x conocido
+            x = self.last_x if self.last_x is not None else center_x
+            err = (x - center_x) / float(center_x)
+            return (float(np.clip(err, -1, 1)), x, int(0.9 * h))
+
+        # ── Candidato ─────────────────────────────────────────────────────
+        self._last_detect_time = time.time()
+        self.prev_x = self.last_x
+
+        # Suavizado EMA
+        if self.last_x is None:
+            self.last_x = float(best_cx)
         else:
-            cx, cy = result
-            error_norm = (cx - w / 2.0) / (w / 2.0)
-            Wc = float(np.clip(-self.Kw * error_norm, -self.Wc_max, self.Wc_max))
-            if tl_state == "yellow":
-                Vc = self.slow_speed
-            elif tl_state in ("none", "green"):
-                Vc = self.normal_speed
-            else:
-                Vc = 0.0
-                Wc = 0.0
+            self.last_x = self.alpha * best_cx + (1 - self.alpha) * self.last_x
 
-        with self.lock:
-            self.traffic_state = tl_state
-            self._cmd_linear   = Vc
-            self._cmd_angular  = Wc
-            self._error_norm   = error_norm
-            self._line_lost    = line_lost
+        smooth_cx = int(self.last_x)
+        err_norm  = (smooth_cx - center_x) / float(center_x)
+        return (float(np.clip(err_norm, -1, 1)), smooth_cx, best_cy)
 
-        # ── Publicar estado semáforo ──────────────────────────────────────
-        msg = String()
-        msg.data = tl_state
-        self.pub_state.publish(msg)
+    # ── Alias para compatibilidad con draw_debug del controller ───────────
+    def detect_center_line(self, image):
+        result = self.detect(image)
+        if result is None:
+            return None
+        _, cx, cy = result
+        return (cx, cy)
 
-        # ── Debug visual ──────────────────────────────────────────────────
-        debug = image.copy()
-        debug = self._draw(debug, result, error_norm, tl_state, line_lost)
-        self._video_writer.write(debug)
-        cv.imshow('PuzzleBot', debug)
-        cv.waitKey(1)
-
-        # ── Log ~1 Hz ─────────────────────────────────────────────────────
-        self._log_count += 1
-        if self._log_count >= 10:
-            self._log_count = 0
-            self.get_logger().info(
-                f"TL={tl_state} | lost={line_lost} err={error_norm:+.2f} "
-                f"Vc={Vc:.2f} Wc={Wc:.2f}"
-            )
-
-    # ══════════════════════════════════════════════════════════════════════
-    def control_callback(self):
-        with self.lock:
-            tl_state  = self.traffic_state
-            Vc        = self._cmd_linear
-            Wc        = self._cmd_angular
-            line_lost = self._line_lost
-
-        # ── Lógica semáforo ───────────────────────────────────────────────
-        if tl_state == "red":
-            if not self.waiting_for_green:
-                self.get_logger().info("RED — esperando VERDE...")
-            self.waiting_for_green = True
-
-        if self.waiting_for_green and tl_state == "green":
-            self.waiting_for_green = False
-            self.get_logger().info("GREEN — reanudando!")
-
-        if self.waiting_for_green:
-            self._publish(0.0, 0.0)
-            return
-
-        self._publish(Vc, Wc)
-
-    # ══════════════════════════════════════════════════════════════════════
-    def _publish(self, linear, angular):
-        cmd = Twist()
-        cmd.linear.x  = float(linear)
-        cmd.angular.z = float(angular)
-        self.pub_vel.publish(cmd)
-
-    def _draw(self, image, result, error_norm, tl_state, line_lost):
+    def draw_debug(self, image, result):
         h, w = image.shape[:2]
+        roi_y    = int(3 * h / 4)
+        x_margin = int(w * 0.30)
 
-        # Línea central de referencia
-        cv.line(image, (w // 2, 0), (w // 2, h), (255, 255, 0), 1)
+        cv2.rectangle(image,
+                      (x_margin, roi_y), (w - x_margin, h),
+                      (0, 0, 255), 2)
+        cv2.line(image, (w // 2, roi_y), (w // 2, h), (255, 255, 0), 1)
 
-        # Punto y ROI del line detector
-        self.line_detector.draw_debug(image, result)
-
-        # Punto detectado
         if result is not None:
             cx, cy = result
-            color = (0, 255, 0) if not line_lost else (0, 0, 255)
-            cv.circle(image, (cx, cy), 8, color, -1)
-            cv.line(image, (w // 2, cy), (cx, cy), color, 2)
-
-        # HUD
-        tl_color = {
-            "red": (0,0,255), "yellow": (0,255,255),
-            "green": (0,255,0), "none": (255,255,255)
-        }.get(tl_state, (255,255,255))
-
-        overlay = image.copy()
-        cv.rectangle(overlay, (10, 10), (400, 120), (0,0,0), -1)
-        cv.addWeighted(overlay, 0.6, image, 0.4, 0, image)
-
-        cv.putText(image, f"Traffic: {tl_state.upper()}", (20, 48),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, tl_color, 2)
-        cv.putText(image, f"Err: {error_norm:+.2f}  Wait: {self.waiting_for_green}",
-                   (20, 85), cv.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 1)
-        if line_lost:
-            cv.putText(image, "LINE LOST", (w//2 - 90, h//2),
-                       cv.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 3)
-
+            cv2.circle(image, (cx, cy), 8, (0, 255, 0), -1)
+            cv2.line(image, (w // 2, cy), (cx, cy), (0, 255, 0), 2)
         return image
-
-    # ══════════════════════════════════════════════════════════════════════
-    def destroy_node(self):
-        try:
-            self._publish(0.0, 0.0)
-        except Exception:
-            pass
-        self.cap.release()
-        self._video_writer.release()
-        cv.destroyAllWindows()
-        self.get_logger().info(f"Video guardado: {self._video_path}")
-        super().destroy_node()
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = LineFollowerController()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("Detenido por el usuario")
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
