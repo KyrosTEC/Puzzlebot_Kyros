@@ -52,43 +52,46 @@ class PIDController:
         self._d_filtered = 0.0
         self._prev_time  = None
 
-    def compute(self, error: float) -> float:
+    def compute(self, error: float, dead_zone: float = 0.0) -> float:
+        """
+        dead_zone: si |error| < dead_zone se trata como cero.
+                   Elimina correcciones innecesarias en rectas.
+        """
         now = time.time()
 
         if self._prev_time is None:
             dt = 0.02
         else:
             dt = now - self._prev_time
-            dt = max(dt, 1e-4)   # evitar división por cero
+            dt = max(dt, 1e-4)
         self._prev_time = now
 
-        # Término proporcional
+        # ── Zona muerta ────────────────────────────────────────────────
+        if abs(error) < dead_zone:
+            error = 0.0
+
+        # ── Término proporcional ───────────────────────────────────────
         P = self.Kp * error
 
-        # Término derivativo (EMA sobre de/dt)
+        # ── Término derivativo (EMA sobre de/dt) ──────────────────────
+        # alpha_d bajo = más suavizado → menos sensible al ruido de visión
         raw_d = (error - self._prev_error) / dt
         self._d_filtered = (self.alpha_d * raw_d +
                             (1 - self.alpha_d) * self._d_filtered)
         D = self.Kd * self._d_filtered
 
-        # Salida sin integrador (para anti-windup)
+        # ── Anti-windup ────────────────────────────────────────────────
         output_pd = P + D
         output_pd_clamped = float(np.clip(output_pd, self.out_min, self.out_max))
-
-        # Anti-windup: integrar solo si no estamos saturados o el error
-        # ayuda a salir de la saturación
         saturated = (output_pd != output_pd_clamped)
         if not saturated or (error * self._integral < 0):
             self._integral += error * dt
 
-        # Límite del integrador (wind-up cap)
         max_integral = 0.5 / max(self.Ki, 1e-6)
         self._integral = float(np.clip(self._integral, -max_integral, max_integral))
-
         I = self.Ki * self._integral
 
         output = float(np.clip(P + I + D, self.out_min, self.out_max))
-
         self._prev_error = error
         return output
 
@@ -125,14 +128,28 @@ class LineFollowerController(Node):
         #   2. Kp = 0.6 * Kp_crítico
         #   3. Kd ≈ Kp * 0.05  (muy pequeño al inicio)
         #   4. Ki ≈ Kp * 0.01  (si persiste offset)
+        # ── Guía de ajuste (tuning) ───────────────────────────────────────
+        # Si OSCILA (sways): baja Kp  o  sube Kd.
+        # Si TARDA en corregir: sube Kp ligeramente.
+        # Si hay OFFSET permanente en recta: sube Ki apenas (0.01 pasos).
+        # Si el DERIVATIVO hace ruido: baja alpha_d (más suavizado).
+        # Secuencia recomendada:
+        #   1. Ki=0, Kd=0 → ajusta Kp hasta seguir sin oscilar
+        #   2. Sube Kd hasta que las oscilaciones desaparezcan
+        #   3. Solo si persiste drift lateral añade Ki pequeño
         self.pid_angular = PIDController(
-            Kp=1.4,
-            Ki=0.05,
-            Kd=0.12,
-            output_min=-2.0,
-            output_max= 2.0,
-            alpha_d=0.25,
+            Kp=0.80,   # ↓ era 1.4 — menos agresivo en la corrección inicial
+            Ki=0.00,   # ↓ era 0.05 — apagado hasta eliminar la oscilación
+            Kd=0.30,   # ↑ era 0.12 — más amortiguación del sway
+            output_min=-1.8,
+            output_max= 1.8,
+            alpha_d=0.15,  # ↓ era 0.25 — derivada más suavizada (menos ruido)
         )
+
+        # Zona muerta angular: errores < este umbral se tratan como cero.
+        # Evita micro-correcciones constantes en rectas largas.
+        # Sube si el robot tiembla en recta; baja si pierde curvas suaves.
+        self.pid_dead_zone = 0.04
 
         # ── Velocidades ───────────────────────────────────────────────────
         self.normal_speed    = 0.08   # m/s en recta libre
@@ -234,7 +251,8 @@ class LineFollowerController(Node):
 
             # ── PID angular ───────────────────────────────────────────────
             # Negamos porque error>0 (línea a la derecha) → girar derecha (Wc<0)
-            Wc = self.pid_angular.compute(-error_norm)
+            Wc = self.pid_angular.compute(-error_norm,
+                                          dead_zone=self.pid_dead_zone)
 
             # ── Velocidad lineal adaptativa ───────────────────────────────
             if tl_state == "yellow":
