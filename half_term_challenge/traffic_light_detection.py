@@ -31,33 +31,22 @@ def gstreamer_pipeline(
 
 
 class TrafficLightDetection:
-    """
-    Detector de semáforo mejorado.
-
-    Mejoras respecto a la versión original:
-    - HSV dual-range más robustos para condiciones de laboratorio
-    - Filtro de circularidad + área mínima más estricto
-    - Buffer de votación ampliado (7 frames) para mayor estabilidad
-    - Score de confianza devuelto junto al estado (útil para debug)
-    - ROI ajustable y dibujable
-    - Regla verde → amarillo ≠ rojo conservada
-    - Nuevo: umbral de área relativa para ignorar reflexos pequeños
-    """
 
     def __init__(self):
 
         # ── Rangos HSV ────────────────────────────────────────────────────
-        # Rojo: dos bandas (hue wrap-around)
-        self.lower_red1 = np.array([0,   130, 80])
+        # Rojo: hue 0-10 y 168-180 (sin solaparse con amarillo)
+        self.lower_red1 = np.array([0,   140, 80])
         self.upper_red1 = np.array([10,  255, 255])
-        self.lower_red2 = np.array([168, 130, 80])
+        self.lower_red2 = np.array([168, 140, 80])
         self.upper_red2 = np.array([180, 255, 255])
 
-        # Amarillo: rango ampliado para cubrir distintas temperaturas de color
-        self.lower_yellow = np.array([15, 120, 100])
-        self.upper_yellow = np.array([35, 255, 255])
+        # Amarillo + Ámbar + Naranja: hue 11-40
+        # Empieza en 11 para NO solaparse con rojo (0-10)
+        self.lower_yellow = np.array([11, 80, 60])
+        self.upper_yellow = np.array([40, 255, 255])
 
-        # Verde: rango moderado para evitar confusión con líneas del piso
+        # Verde
         self.lower_green = np.array([42, 90, 70])
         self.upper_green = np.array([82, 255, 255])
 
@@ -65,45 +54,40 @@ class TrafficLightDetection:
         self.kernel = np.ones((5, 5), np.uint8)
 
         # ── Umbrales de detección ─────────────────────────────────────────
-        self.min_blob_area   = 400     # píxeles² mínimos del blob
-        self.min_circularity = 0.35    # 0 = cualquier forma, 1 = círculo perfecto
+        self.min_blob_area   = 400
+        self.min_circularity = 0.35
 
-        # ── ROI (fracción del frame) ───────────────────────────────────────
+        # ── ROI ───────────────────────────────────────────────────────────
         self.roi_top    = 0.03
         self.roi_bottom = 0.60
         self.roi_left   = 0.15
         self.roi_right  = 0.85
 
         # ── Suavizado temporal ────────────────────────────────────────────
-        self.buffer_size   = 7                           # frames de votación
+        self.buffer_size   = 7
         self._state_buffer = ["none"] * self.buffer_size
 
-        # ── Último estado confirmado (para regla verde→amarillo) ──────────
+        # ── Último estado confirmado (regla verde→amarillo) ───────────────
         self._last_confirmed_state = "none"
-
-        # ── Confianza interna ─────────────────────────────────────────────
-        self._confidence = 0.0   # fracción de votos del estado ganador
+        self._confidence = 0.0
 
     # ─────────────────────────────────────────────────────────────────────
     @property
     def confidence(self) -> float:
-        """Fracción de votos del estado actual en el buffer (0–1)."""
         return self._confidence
 
-    # ─────────────────────────────────────────────────────────────────────
-    def _apply_morphology(self, mask: np.ndarray) -> np.ndarray:
+    def _apply_morphology(self, mask):
         mask = cv.erode(mask,  self.kernel, iterations=1)
         mask = cv.dilate(mask, self.kernel, iterations=2)
         return mask
 
-    def _crop_roi(self, image: np.ndarray):
+    def _crop_roi(self, image):
         h, w   = image.shape[:2]
-        y1, y2 = int(self.roi_top * h),    int(self.roi_bottom * h)
-        x1, x2 = int(self.roi_left * w),   int(self.roi_right * w)
+        y1, y2 = int(self.roi_top * h),  int(self.roi_bottom * h)
+        x1, x2 = int(self.roi_left * w), int(self.roi_right * w)
         return image[y1:y2, x1:x2], (x1, y1)
 
-    def _largest_circular_blob(self, mask: np.ndarray) -> float:
-        """Devuelve el área del blob más grande que supere los umbrales."""
+    def _largest_circular_blob(self, mask):
         contours, _ = cv.findContours(
             mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE
         )
@@ -121,26 +105,18 @@ class TrafficLightDetection:
         return best
 
     # ─────────────────────────────────────────────────────────────────────
-    def detect_state(self, image: np.ndarray):
+    def detect_state(self, image):
         """
-        Retorna:
-            state       (str)   – 'red' | 'yellow' | 'green' | 'none'
-            red_area    (float) – área del blob rojo detectado
-            yellow_area (float) – ídem amarillo
-            green_area  (float) – ídem verde
+        Retorna (state, red_area, yellow_area, green_area).
 
-        Regla verde → amarillo:
-            Si el último estado confirmado fue 'green' y el suavizado
-            resulta 'red', se devuelve 'yellow' (transición incompleta).
+        Regla verde → amarillo ≠ rojo:
+            Si last_confirmed='green' y smoothed='red' → devuelve 'yellow'.
+            Esto cubre el ámbar del LED que a veces se lee como rojo.
         """
-        # 1. ROI
         roi, _ = self._crop_roi(image)
-
-        # 2. Blur + HSV
         blurred = cv.GaussianBlur(roi, (5, 5), 2)
         hsv     = cv.cvtColor(blurred, cv.COLOR_BGR2HSV)
 
-        # 3. Máscaras
         mask_red = (
             cv.inRange(hsv, self.lower_red1, self.upper_red1) |
             cv.inRange(hsv, self.lower_red2, self.upper_red2)
@@ -148,17 +124,14 @@ class TrafficLightDetection:
         mask_yellow = cv.inRange(hsv, self.lower_yellow, self.upper_yellow)
         mask_green  = cv.inRange(hsv, self.lower_green,  self.upper_green)
 
-        # 4. Morfología
         mask_red    = self._apply_morphology(mask_red)
         mask_yellow = self._apply_morphology(mask_yellow)
         mask_green  = self._apply_morphology(mask_green)
 
-        # 5. Blob más grande y circular por color
         red_area    = self._largest_circular_blob(mask_red)
         yellow_area = self._largest_circular_blob(mask_yellow)
         green_area  = self._largest_circular_blob(mask_green)
 
-        # 6. Estado raw
         best = max(red_area, yellow_area, green_area)
         if best == 0:
             raw_state = "none"
@@ -169,14 +142,13 @@ class TrafficLightDetection:
         else:
             raw_state = "green"
 
-        # 7. Suavizado (majority vote)
         self._state_buffer.pop(0)
         self._state_buffer.append(raw_state)
         smoothed = max(set(self._state_buffer),
                        key=self._state_buffer.count)
         self._confidence = self._state_buffer.count(smoothed) / self.buffer_size
 
-        # 8. Regla verde → amarillo ≠ rojo
+        # Regla verde → rojo NO existe → tratar como yellow
         final = smoothed
         if self._last_confirmed_state == "green" and smoothed == "red":
             final = "yellow"
@@ -187,11 +159,8 @@ class TrafficLightDetection:
         return final, red_area, yellow_area, green_area
 
     # ─────────────────────────────────────────────────────────────────────
-    def draw_status(self, image: np.ndarray,
-                    state: str,
-                    current_goal: int = 0,
-                    total_goals: int  = 0,
-                    waiting: bool     = False) -> np.ndarray:
+    def draw_status(self, image, state,
+                    current_goal=0, total_goals=0, waiting=False):
         h, w = image.shape[:2]
 
         y1 = int(self.roi_top    * h);  y2 = int(self.roi_bottom * h)
@@ -200,7 +169,7 @@ class TrafficLightDetection:
 
         colour_map = {
             "red":    (0, 0, 255),
-            "yellow": (0, 255, 255),
+            "yellow": (0, 200, 255),   # naranja en pantalla para distinguir del amarillo puro
             "green":  (0, 255, 0),
             "none":   (255, 255, 255),
         }
@@ -212,14 +181,14 @@ class TrafficLightDetection:
 
         cv.putText(image, f"Traffic: {state.upper()}", (20, 55),
                    cv.FONT_HERSHEY_SIMPLEX, 1.2, color, 2)
-        cv.putText(image, f"Confidence: {self._confidence:.0%}", (20, 95),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.75, (200, 200, 200), 1)
-        cv.putText(image, f"Goal: {current_goal}/{total_goals}", (20, 130),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        cv.putText(image, f"Waiting green: {waiting}", (20, 165),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 1)
+        cv.putText(image, f"Confidence: {self._confidence:.0%}", (20, 90),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+        cv.putText(image, f"Waiting green: {waiting}", (20, 120),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
         cv.putText(image,
-                   f"buf={self._state_buffer}  last={self._last_confirmed_state}",
-                   (20, 205),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.36, (160, 160, 160), 1)
+                   f"buf={self._state_buffer}",
+                   (20, 148), cv.FONT_HERSHEY_SIMPLEX, 0.36, (160, 160, 160), 1)
+        cv.putText(image,
+                   f"last={self._last_confirmed_state}",
+                   (20, 165), cv.FONT_HERSHEY_SIMPLEX, 0.36, (160, 160, 160), 1)
         return image

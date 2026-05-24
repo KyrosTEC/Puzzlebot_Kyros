@@ -38,7 +38,7 @@ class CenterLineDetector:
 
         # Error normalizado suavizado (para el PID)
         self._smooth_error     : float = 0.0
-        self._error_alpha      : float = 0.4   # segundo EMA sobre el error
+        self._error_alpha      : float = 0.25  # más suavizado (era 0.4)
 
     # ─────────────────────────────────────────────────────────────────────
     def reset_memory(self):
