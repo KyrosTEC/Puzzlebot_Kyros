@@ -137,8 +137,8 @@ class LineFollowerController(Node):
         self.traffic_detector = TrafficLightDetection()
         self.line_detector    = CenterLineDetector(
             alpha=0.35, lost_timeout=2.0,
-            roi_top_frac=0.25,
-            roi_left_frac=0.15, roi_right_frac=0.85,
+            roi_top_frac=0.65,
+            roi_left_frac=0.05, roi_right_frac=0.95,
             lookahead_weight=0.30,
         )
 
