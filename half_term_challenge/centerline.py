@@ -1,4 +1,5 @@
 import time
+from typing import List, Optional
 import numpy as np
 import cv2
 
@@ -18,23 +19,31 @@ class CenterLineDetector:
     def __init__(self,
                  alpha: float = 0.35,
                  lost_timeout: float = 2.0,
-                 roi_top_frac: float = 0.60):
+                 roi_top_frac: float = 0.60,
+                 roi_left_frac: float = 0.0,
+                 roi_right_frac: float = 1.0,
+                 lookahead_weight: float = 0.0):
         """
-        alpha       : factor EMA para suavizado de posición  (0 < α < 1)
-        lost_timeout: segundos sin detección antes de reportar None
-        roi_top_frac: fracción vertical donde empieza el ROI  (p.ej. 0.60)
+        alpha           : factor EMA para suavizado de posición  (0 < α < 1)
+        lost_timeout    : segundos sin detección antes de reportar None
+        roi_top_frac    : fracción vertical donde empieza el ROI
+        roi_left_frac   : fracción horizontal del borde izquierdo del ROI
+        roi_right_frac  : fracción horizontal del borde derecho del ROI
+        lookahead_weight: ignorado (compatibilidad con versiones anteriores)
         """
-        self.alpha        = alpha
-        self.lost_timeout = lost_timeout
-        self.roi_top_frac = roi_top_frac
+        self.alpha          = alpha
+        self.lost_timeout   = lost_timeout
+        self.roi_top_frac   = roi_top_frac
+        self.roi_left_frac  = roi_left_frac
+        self.roi_right_frac = roi_right_frac
 
         # Historial de posiciones (últimas 5)
-        self._history: list[int] = []
+        self._history: List[int] = []
         self._history_size = 5
 
         # Estado para cálculo de error derivativo externo
-        self.smooth_x          : float | None = None
-        self._last_detect_time : float | None = None
+        self.smooth_x          : Optional[float] = None
+        self._last_detect_time : Optional[float] = None
 
         # Error normalizado suavizado (para el PID)
         self._smooth_error     : float = 0.0
@@ -66,8 +75,10 @@ class CenterLineDetector:
         center_x = w // 2
 
         # ── ROI ─────────────────────────────────────────────────────────
-        roi_y = int(self.roi_top_frac * h)
-        roi   = image[roi_y:h, :]
+        roi_y  = int(self.roi_top_frac   * h)
+        roi_x1 = int(self.roi_left_frac  * w)
+        roi_x2 = int(self.roi_right_frac * w)
+        roi    = image[roi_y:h, roi_x1:roi_x2]
 
         # ── Preprocesado ─────────────────────────────────────────────────
         gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -137,7 +148,7 @@ class CenterLineDetector:
 
             if score < best_score:
                 best_score     = score
-                best_candidate = (cx, cy + roi_y)
+                best_candidate = (cx + roi_x1, cy + roi_y)
 
         # ── Sin candidato válido ──────────────────────────────────────
         if best_candidate is None:
@@ -182,8 +193,10 @@ class CenterLineDetector:
         h, w = image.shape[:2]
         roi_y = int(self.roi_top_frac * h)
 
-        # ROI box
-        cv2.rectangle(image, (0, roi_y), (w, h), (100, 100, 255), 1)
+        # ROI box (with horizontal crop)
+        roi_x1 = int(getattr(self, 'roi_left_frac',  0.0) * w)
+        roi_x2 = int(getattr(self, 'roi_right_frac', 1.0) * w)
+        cv2.rectangle(image, (roi_x1, roi_y), (roi_x2, h), (100, 100, 255), 1)
         # Línea central
         cv2.line(image, (w // 2, roi_y), (w // 2, h), (255, 255, 0), 1)
 
