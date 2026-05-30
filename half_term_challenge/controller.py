@@ -169,11 +169,14 @@ class LineFollowerController(Node):
         )
 
         # ── Camera (V4L2 — wide-angle IMX219) ─────────────────────────────
+        # In controller.py, replace the camera open section:
         self.get_logger().info("Opening camera via V4L2 (/dev/video0)...")
         self.cap = cv.VideoCapture(0, cv.CAP_V4L2)
         if self.cap.isOpened():
-            self.cap.set(cv.CAP_PROP_FRAME_WIDTH,  self.CAM_W)
-            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.CAM_H)
+            # Set resolution BEFORE reading any frames
+            self.cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))  # ← force MJPEG
+            self.cap.set(cv.CAP_PROP_FRAME_WIDTH,  self.CAM_W)   # 640
+            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.CAM_H)   # 480
             self.cap.set(cv.CAP_PROP_FPS,           15)
             self.cap.set(cv.CAP_PROP_BUFFERSIZE,     1)
             self.get_logger().info(
