@@ -12,6 +12,7 @@ import cv2 as cv
 from half_term_challenge.traffic_light_detection import TrafficLightDetection, gstreamer_pipeline
 from half_term_challenge.centerline import CenterLineDetector
 
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class PIDController:
     def __init__(self,
@@ -84,7 +85,7 @@ class LineFollowerController(Node):
     # Set to None to disable undistortion (e.g. when using the CSI lens).
     # When using the wide-angle lens, set to the path of your calibration file:
     if CAMERA_MODE == "v4l2":
-        CALIB_FILE = "./calibracion_jetson.npz"
+        CALIB_FILE = os.path.join(_PKG_DIR, "calibracion_jetson.npz")
     else:
         CALIB_FILE = None
 
