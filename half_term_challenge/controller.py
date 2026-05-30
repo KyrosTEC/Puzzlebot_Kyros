@@ -138,9 +138,9 @@ class LineFollowerController(Node):
         #   2. Sube Kd hasta que las oscilaciones desaparezcan
         #   3. Solo si persiste drift lateral añade Ki pequeño
         self.pid_angular = PIDController(
-            Kp=0.80,   # ↓ era 1.4 — menos agresivo en la corrección inicial
-            Ki=0.00,   # ↓ era 0.05 — apagado hasta eliminar la oscilación
-            Kd=0.30,   # ↑ era 0.12 — más amortiguación del sway
+            Kp=1.0,   # ↓ era 1.4 — menos agresivo en la corrección inicial
+            Ki=0.025,   # ↓ era 0.05 — apagado hasta eliminar la oscilación
+            Kd=0.25,   # ↑ era 0.12 — más amortiguación del sway
             output_min=-1.8,
             output_max= 1.8,
             alpha_d=0.15,  # ↓ era 0.25 — derivada más suavizada (menos ruido)
@@ -175,7 +175,7 @@ class LineFollowerController(Node):
         self.line_detector    = CenterLineDetector(
             alpha=0.35,
             lost_timeout=2.0,
-            roi_top_frac=0.60,
+            roi_top_frac=0.40,
         )
 
         # ── Cámara ────────────────────────────────────────────────────────
