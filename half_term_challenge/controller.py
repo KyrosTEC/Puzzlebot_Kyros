@@ -168,37 +168,31 @@ class LineFollowerController(Node):
             lookahead_weight=0.30,
         )
 
-        # ── Camera (wide-angle IMX219 via GStreamer v4l2src) ──────────────
-        # Plain CAP_V4L2 ignores resolution settings on this sensor and
-        # always opens at 3264x2464. GStreamer pipeline forces resolution.
-        v4l2_pipeline = (
-            f"v4l2src device=/dev/video0 ! "
+        # ── Camera — same pipeline as dataset capture tool ────────────────
+        # Uses nvarguscamerasrc (Argus) at 640x480, exactly like the dataset
+        # capture script that successfully opened the wide-angle camera.
+        argus_pipeline = (
+            f"nvarguscamerasrc sensor-id=0 ! "
+            f"video/x-raw(memory:NVMM), "
+            f"width={self.CAM_W}, height={self.CAM_H}, "
+            f"format=NV12, framerate=15/1 ! "
+            f"nvvidconv flip-method=0 ! "
             f"video/x-raw, width={self.CAM_W}, height={self.CAM_H}, "
-            f"framerate=15/1 ! "
+            f"format=BGRx ! "
             f"videoconvert ! "
             f"video/x-raw, format=BGR ! "
             f"appsink max-buffers=1 drop=true"
         )
         self.get_logger().info(
-            f"Opening camera via GStreamer v4l2src ({self.CAM_W}x{self.CAM_H})..."
+            f"Opening camera via Argus ({self.CAM_W}x{self.CAM_H})..."
         )
-        self.cap = cv.VideoCapture(v4l2_pipeline, cv.CAP_GSTREAMER)
-        if not self.cap.isOpened():
-            self.get_logger().warn("GStreamer v4l2src failed — trying plain V4L2...")
-            self.cap = cv.VideoCapture(0, cv.CAP_V4L2)
-            if self.cap.isOpened():
-                self.cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
-                self.cap.set(cv.CAP_PROP_FRAME_WIDTH,  self.CAM_W)
-                self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.CAM_H)
-                self.cap.set(cv.CAP_PROP_FPS, 15)
-                self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = cv.VideoCapture(argus_pipeline, cv.CAP_GSTREAMER)
         if self.cap.isOpened():
-            self.get_logger().info(
-                f"Camera opened! ({int(self.cap.get(cv.CAP_PROP_FRAME_WIDTH))}x"
-                f"{int(self.cap.get(cv.CAP_PROP_FRAME_HEIGHT))})"
-            )
+            self.get_logger().info("Camera opened successfully!")
         else:
-            self.get_logger().error("Cannot open camera! Check /dev/video0")
+            self.get_logger().error(
+                "Cannot open camera! Try: sudo systemctl restart nvargus-daemon"
+            )
 
         # ── Video recording ───────────────────────────────────────────────
         ts         = time.strftime("%Y%m%d_%H%M%S")
