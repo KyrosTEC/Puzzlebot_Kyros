@@ -343,7 +343,7 @@ class LineFollowerController(Node):
         self._log_count += 1
         if self._log_count >= 10:
             self._log_count = 0
-            calib = "undistort=ON" if self._map1 else "undistort=OFF"
+            calib = "undistort=ON" if self._map1 is not None else "undistort=OFF"
             self.get_logger().info(
                 f"TL={tl_state} | state={state} | "
                 f"err={error_norm:+.3f} | Vc={Vc:.3f} Wc={Wc:+.3f} | {calib}"
@@ -452,10 +452,10 @@ class LineFollowerController(Node):
                    f"Ki={self.pid_angular.Ki} Kd={self.pid_angular.Kd}",
                    (20, 140), cv.FONT_HERSHEY_SIMPLEX, 0.4, (170,170,170), 1)
 
-        calib_label = "undistort=ON" if self._map1 else "undistort=OFF"
+        calib_label = "undistort=ON" if self._map1 is not None else "undistort=OFF"
         cv.putText(image, calib_label,
                    (20, 158), cv.FONT_HERSHEY_SIMPLEX, 0.38,
-                   (0,255,100) if self._map1 else (80,80,80), 1)
+                   (0,255,100) if self._map1 is not None else (80,80,80), 1)
 
         # Sign detections summary on HUD
         if detections:
