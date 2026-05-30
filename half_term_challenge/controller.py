@@ -77,14 +77,14 @@ class LineFollowerController(Node):
     # ── Camera mode ───────────────────────────────────────────────────────
     # "csi"  → original CSI camera via Argus/GStreamer
     # "v4l2" → wide-angle IMX219 via V4L2 (/dev/video0)
-    CAMERA_MODE = "csi"   # ← change to "v4l2" for wide-angle
+    CAMERA_MODE = "v4l2"   # ← change to "v4l2" for wide-angle
 
     # ── Calibration file ──────────────────────────────────────────────────
     # Path to the .npz file produced by calibrate.py.
     # Set to None to disable undistortion (e.g. when using the CSI lens).
     # When using the wide-angle lens, set to the path of your calibration file:
     if CAMERA_MODE == "v4l2":
-        CALIB_FILE = "/home/puzzlebot/ros2_ws/src/half_term_challenge/half_term_challenge/camera_params.npz"
+        CALIB_FILE = "./calibracion_jetson.npz"
     else:
         CALIB_FILE = None
 
